@@ -2004,14 +2004,13 @@ def agent_loop(messages: list, context: dict):
         messages.append({"role": "user", "content": build_user_content(results)})
 
 
-def print_last_assistant(messages: list):
-    for msg in reversed(messages):
+def print_turn_assistants(messages: list, turn_start: int):
+    for msg in messages[turn_start:]:
         if msg.get("role") != "assistant":
             continue
         for block in msg.get("content", []):
             if getattr(block, "type", None) == "text":
                 terminal_print(block.text)
-        break
 
 
 def cron_autorun_loop(history: list, context: dict):
@@ -2021,6 +2020,7 @@ def cron_autorun_loop(history: list, context: dict):
         if not fired:
             continue
         with agent_lock:
+            turn_start = len(history)
             for job in fired:
                 history.append({"role": "user",
                                 "content": f"[Scheduled] {job.prompt}"})
@@ -2028,7 +2028,7 @@ def cron_autorun_loop(history: list, context: dict):
                     f"  \033[35m[cron auto] {job.prompt[:60]}\033[0m")
             agent_loop(history, context)
             context.update(update_context(context, history))
-            print_last_assistant(history)
+            print_turn_assistants(history, turn_start)
 
 
 if __name__ == "__main__":
@@ -2047,11 +2047,12 @@ if __name__ == "__main__":
         if query.strip().lower() in ("q", "exit", ""):
             break
         trigger_hooks("UserPromptSubmit", query)
+        turn_start = len(history)
         history.append({"role": "user", "content": query})
         with agent_lock:
             agent_loop(history, context)
             context = update_context(context, history)
-            print_last_assistant(history)
+            print_turn_assistants(history, turn_start)
 
         inbox = consume_lead_inbox(route_protocol=True)
         if inbox:
