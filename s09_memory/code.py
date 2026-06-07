@@ -450,9 +450,9 @@ CONTEXT_LIMIT = 50000; KEEP_RECENT = 3; PERSIST_THRESHOLD = 30000
 def estimate_size(msgs): return len(str(msgs))
 
 def _block_type(block):
-    return getattr(block, "type", None) if not isinstance(block, dict) else block.get("type")
+    return block.get("type") if isinstance(block, dict) else getattr(block, "type", None)
 
-def _has_tool_use(msg):
+def _message_has_tool_use(msg):
     if msg.get("role") != "assistant":
         return False
     content = msg.get("content")
@@ -471,10 +471,12 @@ def _is_tool_result_message(msg):
 def snip_compact(msgs, mx=50):
     if len(msgs) <= mx: return msgs
     head_end, tail_start = 3, len(msgs) - (mx - 3)
-    if head_end > 0 and _has_tool_use(msgs[head_end - 1]):
+    if head_end > 0 and _message_has_tool_use(msgs[head_end - 1]):
         while head_end < len(msgs) and _is_tool_result_message(msgs[head_end]):
             head_end += 1
-    if tail_start > 0 and tail_start < len(msgs) and _is_tool_result_message(msgs[tail_start]) and _has_tool_use(msgs[tail_start - 1]):
+    if (tail_start > 0 and tail_start < len(msgs)
+            and _is_tool_result_message(msgs[tail_start])
+            and _message_has_tool_use(msgs[tail_start - 1])):
         tail_start -= 1
     if head_end >= tail_start:
         return msgs
@@ -540,7 +542,9 @@ def reactive_compact(msgs):
     write_transcript(msgs)
     summary = summarize_history(msgs)
     tail_start = max(0, len(msgs) - 5)
-    if tail_start > 0 and tail_start < len(msgs) and _is_tool_result_message(msgs[tail_start]) and _has_tool_use(msgs[tail_start - 1]):
+    if (tail_start > 0 and tail_start < len(msgs)
+            and _is_tool_result_message(msgs[tail_start])
+            and _message_has_tool_use(msgs[tail_start - 1])):
         tail_start -= 1
     return [{"role": "user", "content": f"[Reactive compact]\n\n{summary}"}, *msgs[tail_start:]]
 

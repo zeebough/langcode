@@ -1061,15 +1061,17 @@ def estimate_size(messages: list) -> int:
     return len(json.dumps(messages, default=str))
 
 def block_type(block):
-    return getattr(block, "type", None) if not isinstance(block, dict) else block.get("type")
+    return block.get("type") if isinstance(block, dict) else getattr(block, "type", None)
 
-def has_tool_use(message: dict) -> bool:
+
+def message_has_tool_use(message: dict) -> bool:
     if message.get("role") != "assistant":
         return False
     content = message.get("content")
     if not isinstance(content, list):
         return False
     return any(block_type(block) == "tool_use" for block in content)
+
 
 def is_tool_result_message(message: dict) -> bool:
     if message.get("role") != "user":
@@ -1132,10 +1134,12 @@ def snip_compact(messages: list, max_messages: int = 50) -> list:
     if len(messages) <= max_messages:
         return messages
     head_end, tail_start = 3, len(messages) - (max_messages - 3)
-    if head_end > 0 and has_tool_use(messages[head_end - 1]):
+    if head_end > 0 and message_has_tool_use(messages[head_end - 1]):
         while head_end < len(messages) and is_tool_result_message(messages[head_end]):
             head_end += 1
-    if tail_start > 0 and tail_start < len(messages) and is_tool_result_message(messages[tail_start]) and has_tool_use(messages[tail_start - 1]):
+    if (tail_start > 0 and tail_start < len(messages)
+            and is_tool_result_message(messages[tail_start])
+            and message_has_tool_use(messages[tail_start - 1])):
         tail_start -= 1
     if head_end >= tail_start:
         return messages
@@ -1191,7 +1195,9 @@ def reactive_compact(messages: list) -> list:
     except Exception:
         summary = "Earlier conversation was trimmed after a prompt-too-long error."
     tail_start = max(0, len(messages) - 5)
-    if tail_start > 0 and tail_start < len(messages) and is_tool_result_message(messages[tail_start]) and has_tool_use(messages[tail_start - 1]):
+    if (tail_start > 0 and tail_start < len(messages)
+            and is_tool_result_message(messages[tail_start])
+            and message_has_tool_use(messages[tail_start - 1])):
         tail_start -= 1
     return [{"role": "user", "content": f"[Reactive compact]\n\n{summary}"},
             *messages[tail_start:]]
