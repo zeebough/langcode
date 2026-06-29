@@ -67,7 +67,7 @@ class ContextCompressionMiddleware(AgentMiddleware):
         
         # 5. ReactiveCompact – 最后应急兜底
         if self._estimate_tokens(messages) > self.max_tokens:
-            messages = await self._reactive_compact(messages)
+            messages = await self.reactive_compact(messages)
         
         return {"messages": messages}
     
@@ -159,7 +159,7 @@ class ContextCompressionMiddleware(AgentMiddleware):
             _internal_call.reset(token)
         return response.content if hasattr(response, 'content') else str(response)
     
-    async def _reactive_compact(self, messages: List[BaseMessage]) -> List[BaseMessage]:
+    async def reactive_compact(self, messages: List[BaseMessage]) -> List[BaseMessage]:
         """应急兜底：固定保留最后 5 条消息 + 一个摘要（如果有）"""
         # 尝试生成一个快速摘要
         token = _internal_call.set(True)

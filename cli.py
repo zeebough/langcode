@@ -1,11 +1,12 @@
 # cli.py
-import datetime
 import os
 import subprocess
+import asyncio
 from pathlib import Path
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool
+from langchain_core.messages import AIMessage
 from langchain.agents import create_agent
 from langchain.agents.middleware import TodoListMiddleware
 from langgraph.store.postgres import AsyncPostgresStore
@@ -17,8 +18,15 @@ from typing import Any
 from middlewares.context_compression_middleware import ContextCompressionMiddleware
 from middlewares.memory_management_middleware import MemoryManagementMiddleware
 from middlewares.permission_middleware import PermissionMiddleware
+from middlewares.skill_loading_middleware import SkillLoadingMiddleware
+from middlewares.error_recovery_middleware import ErrorRecoveryMiddleware
 
-load_dotenv()
+# 处理环境变量
+os.environ.pop("API_KEY", None)
+os.environ.pop("MODEL_NAME", None)
+os.environ.pop("BASE_URL", None)
+os.environ.pop("LIGHT_MODEL_NAME", None)
+load_dotenv(override=True)
 WORK_DIR=Path(os.getcwd())
 
 try:
@@ -90,7 +98,7 @@ def edit(path: str, old_text: str, new_text: str) -> str:
 
 @tool
 def glob(pattern: str) -> str:
-    """列出匹配的文件。参数：pattern glob模式（字符串）"""
+    """列出匹配的文件。参数：pattern glob 模式（字符串）"""
     import glob as g
     try:
         results = []
@@ -101,19 +109,40 @@ def glob(pattern: str) -> str:
     except Exception as e:
         return f"Error: {e}"
 
+@tool
+def load_skill(skill_name: str) -> str:
+    """Load a skill by name from the skills directory. Returns the skill content.
+    Parameter: skill_name - the name of the skill to load
+    """
+    skill_dir = WORK_DIR / "skills" / skill_name
+    if not skill_dir.exists():
+        return f"Skill '{skill_name}' not found"
+    
+    skill_file = skill_dir / "SKILL.md"
+    if not skill_file.exists():
+        return f"Skill '{skill_name}' has no SKILL.md file"
+    
+    try:
+        content = skill_file.read_text(encoding="utf-8")
+        return content
+    except Exception as e:
+        return f"Error loading skill: {e}"
+
+
 # ═══════════════════════════════════════════════════════════
 #  Agent Setup using create_agent
 # ═══════════════════════════════════════════════════════════
 
-async def create_coding_agent(checkpointer: AsyncPostgresSaver, store: AsyncPostgresStore) -> Any:
+async def create_coding_agent(checkpointer: AsyncPostgresSaver, store: AsyncPostgresStore, use_backup: bool = False) -> Any:
     """Create the coding agent."""
-    tools = [read_file, write_file, bash, edit, glob]
+    tools = [read_file, write_file, bash, edit, glob, load_skill]
+
     llm = ChatOpenAI(
         model=os.getenv("MODEL_NAME"),
         api_key=os.getenv("API_KEY"),
         base_url=os.getenv("BASE_URL"),
         temperature=0.3,
-        max_completion_tokens=8000
+        max_completion_tokens=1
     )
     
     light_llm = ChatOpenAI(
@@ -125,24 +154,36 @@ async def create_coding_agent(checkpointer: AsyncPostgresSaver, store: AsyncPost
         verbose=False
     )
     
-    # Static system prompt (time is fixed at startup, not critical)
     system_prompt = f"""You are a coding agent LangCode. Act, don't explain.
-Available tools: bash, read_file, write_file, edit_file, glob.
+Available tools: bash, read_file, write_file, edit_file, glob, load_skill.
 Working directory: {WORK_DIR}
 Always think step by step. If you are unsure about the next step, ask the user for clarification.
 """
-    # Create agent with middleware
+    
+    context_compression = ContextCompressionMiddleware(llm=light_llm)
+    error_recovery = ErrorRecoveryMiddleware(
+        primary_llm=llm,
+        fallback_llm=light_llm,
+        context_compressor=context_compression,  # 传入压缩器
+        max_retries=5,
+        max_continuation_attempts=2,
+        max_tokens_for_continuation=64000,
+        consecutive_529_threshold=3,
+    )
+    
     agent = create_agent(
         model=llm,
         tools=tools,
         system_prompt=system_prompt,
         middleware=[
-            PermissionMiddleware(WORK_DIR),      # Custom permission gate
-            TodoListMiddleware(),        # Built-in todo planning
-            MemoryManagementMiddleware(llm=light_llm, store=store),# 长期记忆存取
-            ContextCompressionMiddleware(llm=light_llm),  # 上下文压缩
+            PermissionMiddleware(WORK_DIR),
+            TodoListMiddleware(),
+            MemoryManagementMiddleware(llm=light_llm, store=store),
+            context_compression,
+            SkillLoadingMiddleware(WORK_DIR),
+            error_recovery,
         ],
-        checkpointer=checkpointer, # 短期记忆存取
+        checkpointer=checkpointer,
     )
     return agent
 
@@ -152,7 +193,6 @@ Always think step by step. If you are unsure about the next step, ask the user f
 
 async def run_streaming():
     """Streaming CLI with conversation memory."""
-    # Initialize PostgreSQL connection pool and checkpointer
     DB_URI = f"postgresql://{os.getenv('POSTGRES_USER')}:{os.getenv('POSTGRES_PASSWORD')}@{os.getenv('POSTGRES_HOST')}:{os.getenv('POSTGRES_PORT')}/{os.getenv('POSTGRES_DB')}?sslmode=disable"
     pool = AsyncConnectionPool(DB_URI, 
                                min_size=1, 
@@ -164,19 +204,16 @@ async def run_streaming():
                                })
     await pool.open()
 
-    # short-term memory within a session (thread_id)
     checkpointer = AsyncPostgresSaver(pool)
     await checkpointer.setup()
-    # long-term memory across sessions, no vector search
     store = AsyncPostgresStore(pool)
     await store.setup()
     
     agent = await create_coding_agent(checkpointer, store)
     
-    # 主体会话逻辑
-    user_id = input("输入用户ID (空白则为匿名用户): ").strip() or "匿名用户"
-    thread_id=input("输入thread_id恢复对话 (空白则为新对话): ").strip()
-    if thread_id or thread_id == "" or thread_id=="\n":
+    user_id = input("输入用户 ID (空白则为匿名用户): ").strip() or "匿名用户"
+    thread_id=input("输入 thread_id 恢复对话 (空白则为新对话): ").strip()
+    if not thread_id or thread_id == "" or thread_id=="\n":
         thread_id=f"langcode_session_{id({})}"
     config = {"configurable": {"thread_id": thread_id, "user_id": user_id}}
     
@@ -198,28 +235,64 @@ async def run_streaming():
         
         print(f"\033[32m🤖 LangCode >> \033[0m", end="", flush=True)
         
-        # Stream events from the agent
+        full_response = ""
+        is_truncated = False
+        had_truncation_event = False  # 是否发生过截断事件
+        response_metadata = None
+        continuation_attempts = 0
+        
+        # 用于跟踪是否正在输出（用于清除已输出的内容）
+        output_buffer = []
+        
         async for event in agent.astream_events(
             input={"messages": [{"role": "user", "content": user_input}]},
             config=config,
             version="v2",
         ):
             kind = event.get("event")
+            # 调试：打印所有事件类型
+            # print(f"\n[EVENT] {kind}: {event.get('name')}")
             if kind == "on_chat_model_stream":
-                # 过滤内部 LLM 调用（记忆提取、上下文压缩等）
                 tags = event.get("tags", [])
                 if "internal_memory_call" in tags:
                     continue
-                # 只在主 agent 的 LLM 调用时输出（过滤 middleware 的调用）
                 name = event.get("name", "")
                 if "Middleware" in name:
                     continue
                 content = event.get("data", {}).get("chunk", {}).content
                 if content:
+                    output_buffer.append(content)
                     print(content, end="", flush=True)
+                    full_response += content
                 continue
+            
+            # 捕获模型调用的最终结果，检查是否截断
+            # 注意：可能有多个 on_chat_model_end 事件（原始调用 + 续写调用）
+            if kind == "on_chat_model_end":
+                # 检查响应元数据
+                output_obj = event.get("data", {}).get("output")
+                if isinstance(output_obj, AIMessage):
+                    response_metadata = output_obj.response_metadata
+                    finish_reason = response_metadata.get("finish_reason")
+                    truncation_handled = response_metadata.get("truncation_handled")
                     
-            # Optional: You can also listen for todo list updates
+                    # 检查是否有截断标记（来自 middleware）
+                    if truncation_handled:
+                        had_truncation_event = True
+                        is_truncated = False
+                        continuation_attempts = response_metadata.get("continuation_attempts", 0)
+                    # 第一次截断事件
+                    elif finish_reason == "length":
+                        had_truncation_event = True
+                        is_truncated = True
+                    # 如果之前有截断事件，现在有 stop 事件，说明续写成功
+                    elif finish_reason == "stop" and had_truncation_event:
+                        # 续写成功，但无法获取续写次数（因为续写调用的事件没有 truncation_handled 标记）
+                        # 假设至少续写了 1 次
+                        is_truncated = False
+                        continuation_attempts = 1
+                continue
+                
             if kind == "on_tool_start" and event.get("name") == "write_todos":
                 print("\n[Planning] Agent updated todo list")
                 continue
@@ -230,11 +303,21 @@ async def run_streaming():
                     print("\n[任务列表更新]")
                     for todo in todos:
                         print(f"  {todo['status']}: {todo['content']}")
-                continue
-            
-        print()  # newline after response
+                continue    
+        print()   
         
-    # Clean up
+        if is_truncated:
+            # 未被中间件处理（续写失败或未配置中间件）
+            print("\n\033[33m[系统] 模型回复超长，部分内容可能缺失\033[0m")
+        elif had_truncation_event and not is_truncated:
+            # 已被中间件成功处理
+            print(f"\n\033[33m[系统] 模型回复超长，已自动续写 {continuation_attempts} 次\033[0m")
+        
+        # 检查是否有错误恢复的提示（从响应内容中检测）
+        if full_response and "⚠️" in full_response:
+            # 静默提示，不额外输出
+            pass
+        
     await pool.close()
 
 if __name__ == "__main__":

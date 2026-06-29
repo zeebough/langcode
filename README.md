@@ -1,6 +1,6 @@
 # LangCode - LangChain based Claude Code like coding agent
 
-## Finished
+## completed
 
 - agent loop
 - tool use
@@ -10,11 +10,12 @@
 - context compact + in-session memory (short-term memory): (async postgres checkpointer + context compression middleware (customized))
 - memory: sematic (user preferences) + procedural (behavioral guidelines) + episodic (past experience), LLM-based retrieval, use files as indices for retrieval (long-term memory)
 - system prompt: real-time assembly by the middleware sequence
+- skill-loading：hot-pluggable, requiring no restart
 
 ## in_progress
 
 - subagent
-- skill-loading
+
 
 ## pending
 

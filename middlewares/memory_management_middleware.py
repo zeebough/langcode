@@ -151,7 +151,7 @@ class MemoryManagementMiddleware(AgentMiddleware):
             # 添加新的 text block
             existing_blocks.append({"type": "text", "text": dynamic_content})
             request = request.override(
-                system_message=SystemMessage(content=existing_blocks)
+                system_message=SystemMessage(content_blocks=existing_blocks)
             )
 
         return request
