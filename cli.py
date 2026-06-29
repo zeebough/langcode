@@ -20,6 +20,13 @@ from middlewares.memory_management_middleware import MemoryManagementMiddleware
 from middlewares.permission_middleware import PermissionMiddleware
 from middlewares.skill_loading_middleware import SkillLoadingMiddleware
 from middlewares.error_recovery_middleware import ErrorRecoveryMiddleware
+from lib.message_hub import AsyncPostgresMessageHub
+from lib.lead_agent_tools import create_lead_agent_tools
+from logging import getLogger
+import logging
+
+logging.basicConfig(level=logging.INFO,filemode="a", filename="logs/langcode.log", format="%(asctime)s - %(levelname)s - %(name)s - %(message)s")
+logger = getLogger("__main__")
 
 # 处理环境变量
 os.environ.pop("API_KEY", None)
@@ -133,16 +140,15 @@ def load_skill(skill_name: str) -> str:
 #  Agent Setup using create_agent
 # ═══════════════════════════════════════════════════════════
 
-async def create_coding_agent(checkpointer: AsyncPostgresSaver, store: AsyncPostgresStore, use_backup: bool = False) -> Any:
+async def create_coding_agent(checkpointer: AsyncPostgresSaver, store: AsyncPostgresStore, message_hub: AsyncPostgresMessageHub = None, sub_agents: dict = None, use_backup: bool = False) -> Any:
     """Create the coding agent."""
-    tools = [read_file, write_file, bash, edit, glob, load_skill]
-
+    
     llm = ChatOpenAI(
         model=os.getenv("MODEL_NAME"),
         api_key=os.getenv("API_KEY"),
         base_url=os.getenv("BASE_URL"),
         temperature=0.3,
-        max_completion_tokens=1
+        max_completion_tokens=8000
     )
     
     light_llm = ChatOpenAI(
@@ -154,8 +160,20 @@ async def create_coding_agent(checkpointer: AsyncPostgresSaver, store: AsyncPost
         verbose=False
     )
     
+    tools = [read_file, write_file, bash, edit, glob, load_skill]
+    
+    if message_hub:
+        lead_tools = create_lead_agent_tools(
+            message_hub=message_hub,
+            sub_agents=sub_agents,
+            llm=llm,
+            light_llm=light_llm,
+            checkpointer=checkpointer,
+            work_dir=WORK_DIR,
+        )
+        tools.extend(lead_tools)
+    
     system_prompt = f"""You are a coding agent LangCode. Act, don't explain.
-Available tools: bash, read_file, write_file, edit_file, glob, load_skill.
 Working directory: {WORK_DIR}
 Always think step by step. If you are unsure about the next step, ask the user for clarification.
 """
@@ -164,11 +182,17 @@ Always think step by step. If you are unsure about the next step, ask the user f
     error_recovery = ErrorRecoveryMiddleware(
         primary_llm=llm,
         fallback_llm=light_llm,
-        context_compressor=context_compression,  # 传入压缩器
+        context_compressor=context_compression,
         max_retries=5,
         max_continuation_attempts=2,
         max_tokens_for_continuation=64000,
         consecutive_529_threshold=3,
+    )
+    
+    permission_middleware = PermissionMiddleware(
+        work_dir=WORK_DIR,
+        message_hub=message_hub,
+        agent_name="lead",
     )
     
     agent = create_agent(
@@ -176,7 +200,7 @@ Always think step by step. If you are unsure about the next step, ask the user f
         tools=tools,
         system_prompt=system_prompt,
         middleware=[
-            PermissionMiddleware(WORK_DIR),
+            permission_middleware,
             TodoListMiddleware(),
             MemoryManagementMiddleware(llm=light_llm, store=store),
             context_compression,
@@ -209,13 +233,23 @@ async def run_streaming():
     store = AsyncPostgresStore(pool)
     await store.setup()
     
-    agent = await create_coding_agent(checkpointer, store)
+    message_hub = AsyncPostgresMessageHub(pool)
+    # await message_hub.setup()
+    
+    # 创建 sub_agents 字典，用于跟踪所有 sub agent
+    sub_agents = {"_thread_id": None}  # thread_id 会在后面设置
+    
+    agent = await create_coding_agent(checkpointer, store, message_hub, sub_agents)
     
     user_id = input("输入用户 ID (空白则为匿名用户): ").strip() or "匿名用户"
     thread_id=input("输入 thread_id 恢复对话 (空白则为新对话): ").strip()
     if not thread_id or thread_id == "" or thread_id=="\n":
         thread_id=f"langcode_session_{id({})}"
     config = {"configurable": {"thread_id": thread_id, "user_id": user_id}}
+    
+    # 设置 sub_agents 的 thread_id
+    if sub_agents:
+        sub_agents["_thread_id"] = thread_id
     
     print("=" * 50)
     print("LangCode - 编码助手")
@@ -224,6 +258,15 @@ async def run_streaming():
     print(f"🤖 Session started with thread_id: {thread_id} for user: {user_id}")
     
     while True:
+        pending_permissions = await message_hub.get_pending_permissions()
+        if pending_permissions:
+            print("\n\033[33m[待审批权限请求]\033[0m")
+            for i, perm in enumerate(pending_permissions, 1):
+                print(f"  [{i}] {perm['agent_name']}: {perm['command']}")
+                print(f"      工具：{perm['tool_name']}")
+                print(f"      请求 ID: {perm['request_id']}")
+            print("\n使用 approve_permission <request_id> [reason] 或 reject_permission <request_id> <reason>")
+        
         user_input = input("\033[36m用户 >> \033[0m")
         if user_input.lower() == "exit":
             break
@@ -232,6 +275,40 @@ async def run_streaming():
             config = {"configurable": {"thread_id": thread_id, "user_id": user_id}}
             print("🤖 会话已重置")
             continue
+        
+        if user_input.startswith("approve_permission "):
+            parts = user_input.split(" ", 2)
+            if len(parts) >= 2:
+                request_id = parts[1]
+                reason = parts[2] if len(parts) > 2 else ""
+                tools = create_lead_agent_tools(
+                    message_hub=message_hub,
+                    llm=None,
+                    light_llm=None,
+                    checkpointer=None,
+                    work_dir=None,
+                )
+                approve_tool = next(t for t in tools if t.name == "approve_permission")
+                result = await approve_tool.ainvoke({"request_id": request_id, "reason": reason})
+                print(f"\033[32m{result}\033[0m")
+                continue
+        
+        if user_input.startswith("reject_permission "):
+            parts = user_input.split(" ", 2)
+            if len(parts) >= 3:
+                request_id = parts[1]
+                reason = parts[2]
+                tools = create_lead_agent_tools(
+                    message_hub=message_hub,
+                    llm=None,
+                    light_llm=None,
+                    checkpointer=None,
+                    work_dir=None,
+                )
+                reject_tool = next(t for t in tools if t.name == "reject_permission")
+                result = await reject_tool.ainvoke({"request_id": request_id, "reason": reason})
+                print(f"\033[31m{result}\033[0m")
+                continue
         
         print(f"\033[32m🤖 LangCode >> \033[0m", end="", flush=True)
         
@@ -246,7 +323,7 @@ async def run_streaming():
         
         async for event in agent.astream_events(
             input={"messages": [{"role": "user", "content": user_input}]},
-            config=config,
+            config={**config, "recursion_limit": 100},
             version="v2",
         ):
             kind = event.get("event")

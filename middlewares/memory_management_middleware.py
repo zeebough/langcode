@@ -1,16 +1,16 @@
 import datetime
-import contextvars
 from typing import List, Dict
 from langchain_core.messages import AIMessage, SystemMessage
 from langchain_core.language_models import BaseChatModel
 from langgraph.store.base import BaseStore
 from langchain.agents.middleware import AgentMiddleware, ModelRequest, Runtime
 from langchain.agents.middleware.types import AgentState
+import logging
 
 from middlewares.memory_saver import MemorySaver
+from middlewares.context_vars import _internal_call
 
-# Context var to track internal LLM calls (avoid recursion)
-_internal_call = contextvars.ContextVar("_internal_call", default=False)
+logger = logging.getLogger(__name__)
 
 
 class MemoryManagementMiddleware(AgentMiddleware):
@@ -41,7 +41,8 @@ class MemoryManagementMiddleware(AgentMiddleware):
         return index
 
     async def _select_relevant_keys(self, task: str, recent_context: str, index: List[Dict]) -> List[str]:
-        """调用 LLM 选择最相关的记忆 key（最多5个）"""
+        """调用 LLM 选择最相关的记忆 key（最多 5 个）"""
+        logger.info("MemoryManagementMiddleware._select_relevant_keys called")
         if not index:
             return []
 
@@ -51,7 +52,7 @@ class MemoryManagementMiddleware(AgentMiddleware):
             for item in index
         ])
 
-        prompt = f"""你是一个记忆检索助手。根据最近的对话，从以下记忆列表中选择最多5个最相关的记忆。
+        prompt = f"""你是一个记忆检索助手。根据最近的对话，从以下记忆列表中选择最多 5 个最相关的记忆。
 
 用户最新提问：
 {task[:500]}
@@ -65,11 +66,15 @@ class MemoryManagementMiddleware(AgentMiddleware):
 请只返回选中的 key 列表，用英文逗号分隔，不要包含其他内容。
 例如：key1, key3, key7
 """
-        response = await self.llm.with_config(
-            callbacks=[],
-            tags=["internal_memory_call"],
-            metadata={"internal": True}
-        ).ainvoke(prompt)
+        token = _internal_call.set(True)
+        try:
+            response = await self.llm.with_config(
+                callbacks=[],
+                tags=["internal_memory_call"],
+                metadata={"internal": True}
+            ).ainvoke(prompt)
+        finally:
+            _internal_call.reset(token)
         # 解析响应
         raw_keys = [k.strip() for k in response.content.split(',') if k.strip()]
         # 去重并限制 ≤5
@@ -98,6 +103,8 @@ class MemoryManagementMiddleware(AgentMiddleware):
         # 检查是否是内部 LLM 调用（避免递归）
         if _internal_call.get():
             return request
+        
+        logger.info("MemoryManagementMiddleware.modify_model_request called")
         
         # 1. 检查最近一条用户消息是否包含禁用关键词
         messages = state.get("messages", [])
@@ -167,5 +174,6 @@ class MemoryManagementMiddleware(AgentMiddleware):
             return None
         if bool(getattr(last_message, 'tool_calls', [])):
             return None
+        logger.info("MemoryManagementMiddleware.aafter_model called")
         await self.memory_saver.extract_and_save(state["messages"])
         return None

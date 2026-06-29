@@ -5,10 +5,10 @@ from langchain_core.messages import BaseMessage
 import datetime
 import json
 import hashlib
-import contextvars
+import logging
+from middlewares.context_vars import _internal_call
 
-# Context var to track internal LLM calls (avoid recursion)
-_internal_call = contextvars.ContextVar("_internal_call", default=False)
+logger = logging.getLogger(__name__)
 
 class MemorySaver:
     def __init__(self, llm: BaseChatModel, store: BaseStore, user_id: str = "default_user"):
@@ -23,8 +23,9 @@ class MemorySaver:
         """
         从对话中提取三类记忆并保存到 store。
         """
+        logger.info("MemorySaver.extract_and_save called")
         # 1. 选择最近相关对话（可限制轮数或 token 数）
-        recent_msgs = messages[-10:]   # 取最近10条
+        recent_msgs = messages[-10:]   # 取最近 10 条
 
         # 2. 调用 LLM 提取记忆
         extracted = await self._extract_memories(recent_msgs)
@@ -37,6 +38,7 @@ class MemorySaver:
 
     async def _extract_memories(self, messages: List[BaseMessage]) -> Dict[str, List[Dict]]:
         """使用 LLM 从对话中提取三类记忆，返回结构化数据。"""
+        logger.info("MemorySaver._extract_memories called")
         # 构建对话文本
         conversation = "\n".join([f"{m.type}: {m.content}" for m in messages])
 

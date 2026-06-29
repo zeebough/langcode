@@ -11,19 +11,18 @@
 - memory: sematic (user preferences) + procedural (behavioral guidelines) + episodic (past experience), LLM-based retrieval, use files as indices for retrieval (long-term memory)
 - system prompt: real-time assembly by the middleware sequence
 - skill-loading：hot-pluggable, requiring no restart
+- error recovery
 
 ## in_progress
 
 - subagent
-
+- task system
+- background tasks
+- agent teams
 
 ## pending
 
-- error recovery
-- task system
-- background tasks
 - cron scheduler
-- agent teams
 - team protocols
 - autonomous agents
 - worktree isolation

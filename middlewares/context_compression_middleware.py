@@ -11,10 +11,10 @@ import tiktoken
 import time
 import hashlib
 import aiofiles
-import contextvars
+import logging
+from middlewares.context_vars import _internal_call
 
-# Context var to track internal LLM calls (avoid recursion)
-_internal_call = contextvars.ContextVar("_internal_call", default=False)
+logger = logging.getLogger(__name__)
 
 
 
@@ -46,11 +46,14 @@ class ContextCompressionMiddleware(AgentMiddleware):
     ) -> dict[str, any] | None:
         # 检查是否是内部 LLM 调用（避免递归）
         if _internal_call.get():
+            logger.debug("ContextCompressionMiddleware.abefore_model: internal call, skipping")
             return None
             
         messages = state.get("messages", [])
         if not messages:
             return None
+        
+        logger.info("ContextCompressionMiddleware.abefore_model called")
         
         # 1. ToolResult Budget – 超大工具结果落盘预览
         messages = await self._tool_result_budget(messages)
@@ -63,10 +66,12 @@ class ContextCompressionMiddleware(AgentMiddleware):
         
         # 4. AutoCompact – 主动 LLM 摘要
         if self._estimate_tokens(messages) > self.max_tokens:
+            logger.info("ContextCompressionMiddleware._auto_compact triggered")
             messages = await self._auto_compact(messages)
         
         # 5. ReactiveCompact – 最后应急兜底
         if self._estimate_tokens(messages) > self.max_tokens:
+            logger.info("ContextCompressionMiddleware.reactive_compact triggered")
             messages = await self.reactive_compact(messages)
         
         return {"messages": messages}
@@ -120,6 +125,7 @@ class ContextCompressionMiddleware(AgentMiddleware):
     
     async def _auto_compact(self, messages: List[BaseMessage]) -> List[BaseMessage]:
         """尝试使用 LLM 生成摘要替换整个上下文，最多重试 auto_compact_max_retries 次"""
+        logger.info("ContextCompressionMiddleware._auto_compact called")
         for attempt in range(self.auto_compact_max_retries):
             try:
                 # Set internal call flag to avoid triggering middleware
@@ -138,12 +144,14 @@ class ContextCompressionMiddleware(AgentMiddleware):
                     return compacted
             except Exception as e:
                 # 重试失败则继续尝试，最后使用 reactive_compact
+                logger.warning(f"ContextCompressionMiddleware._auto_compact attempt {attempt+1} failed: {e}")
                 continue
         # 重试用尽仍未达标，返回原消息（交给 reactive）
         return messages
     
     async def _summarize_messages(self, messages: List[BaseMessage]) -> str:
         """调用大模型生成摘要"""
+        logger.info("ContextCompressionMiddleware._summarize_messages called")
         conv_text = "\n".join([f"{m.__class__.__name__}: {m.content[:500]}" for m in messages])
         prompt = ("Summarize this coding-agent conversation so work can continue.\n"
               "Preserve: 1. current goal, 2. key findings/decisions, 3. files read/changed, "
@@ -161,6 +169,7 @@ class ContextCompressionMiddleware(AgentMiddleware):
     
     async def reactive_compact(self, messages: List[BaseMessage]) -> List[BaseMessage]:
         """应急兜底：固定保留最后 5 条消息 + 一个摘要（如果有）"""
+        logger.info("ContextCompressionMiddleware.reactive_compact called")
         # 尝试生成一个快速摘要
         token = _internal_call.set(True)
         try:

@@ -8,6 +8,9 @@ from langchain_core.messages import AIMessage, HumanMessage, BaseMessage
 from langchain_core.language_models import BaseChatModel
 from langchain_openai import ChatOpenAI
 import os
+from middlewares.context_vars import _internal_call
+
+logger = logging.getLogger(__name__)
 
 # 自定义异常类型，便于分类处理
 class ContextLengthExceededError(Exception):
@@ -94,8 +97,9 @@ class ErrorRecoveryMiddleware(AgentMiddleware):
         **kwargs,
     ) -> AIMessage:
         """
-        带指数退避+抖动的重试调用
+        带指数退避 + 抖动的重试调用
         """
+        logger.info("ErrorRecoveryMiddleware._call_with_retry called")
         base_delay = 1.0
         max_delay = 60.0
         backoff_factor = 2.0
@@ -104,7 +108,11 @@ class ErrorRecoveryMiddleware(AgentMiddleware):
         
         for attempt in range(self.max_retries):
             try:
-                return await llm.ainvoke(messages, **kwargs)
+                token = _internal_call.set(True)
+                try:
+                    return await llm.ainvoke(messages, **kwargs)
+                finally:
+                    _internal_call.reset(token)
             except Exception as e:
                 last_error = e
                 
@@ -112,23 +120,27 @@ class ErrorRecoveryMiddleware(AgentMiddleware):
                     # 非临时故障直接抛出
                     raise
                 
-                # 检查是否为529
+                # 检查是否为 529
                 if self._is_529_error(e):
                     self._consecutive_529_count += 1
-                    self.logger.warning(
-                        f"529错误 (第{attempt+1}次尝试)，连续次数: {self._consecutive_529_count}"
+                    logger.warning(
+                        f"ErrorRecoveryMiddleware: 529 错误 (第{attempt+1}次尝试)，连续次数：{self._consecutive_529_count}"
                     )
                     
-                    # 连续529达到阈值，切换到备用模型
+                    # 连续 529 达到阈值，切换到备用模型
                     if self._consecutive_529_count >= self.consecutive_529_threshold:
-                        self.logger.info("连续529错误，切换到备用模型")
+                        logger.info("ErrorRecoveryMiddleware: 连续 529 错误，切换到备用模型")
                         try:
-                            return await self.fallback_llm.ainvoke(messages, **kwargs)
+                            token = _internal_call.set(True)
+                            try:
+                                return await self.fallback_llm.ainvoke(messages, **kwargs)
+                            finally:
+                                _internal_call.reset(token)
                         except Exception as fallback_error:
-                            self.logger.error(f"备用模型也失败: {fallback_error}")
+                            logger.error(f"ErrorRecoveryMiddleware: 备用模型也失败：{fallback_error}")
                             raise fallback_error
                 else:
-                    # 非529的临时故障（如429），重置529计数
+                    # 非 529 的临时故障（如 429），重置 529 计数
                     self._consecutive_529_count = 0
                 
                 # 计算退避延迟（含抖动）
@@ -136,7 +148,7 @@ class ErrorRecoveryMiddleware(AgentMiddleware):
                 jitter = random.uniform(0, 0.5 * delay)
                 total_delay = delay + jitter
                 
-                self.logger.info(f"临时故障，{total_delay:.2f}秒后重试 (尝试 {attempt+1}/{self.max_retries})")
+                logger.info(f"ErrorRecoveryMiddleware: 临时故障，{total_delay:.2f}秒后重试 (尝试 {attempt+1}/{self.max_retries})")
                 await asyncio.sleep(total_delay)
         
         # 所有重试都失败
@@ -151,17 +163,18 @@ class ErrorRecoveryMiddleware(AgentMiddleware):
         """
         处理输出截断：发起续写
         """
+        logger.info("ErrorRecoveryMiddleware._handle_truncation called")
         self._continuation_attempts += 1
         
         if self._continuation_attempts > self.max_continuation_attempts:
-            self.logger.warning(f"续写尝试已达上限 ({self.max_continuation_attempts})")
+            logger.warning(f"ErrorRecoveryMiddleware: 续写尝试已达上限 ({self.max_continuation_attempts})")
             # 返回部分内容，让上层知晓
             return AIMessage(
                 content=partial_response + "\n\n[⚠️ 回复被截断，已达到最大续写尝试次数]",
                 response_metadata={"finish_reason": "length", "truncation_handled": True}
             )
         
-        self.logger.info(f"检测到截断，发起第 {self._continuation_attempts} 次续写")
+        logger.info(f"ErrorRecoveryMiddleware: 检测到截断，发起第 {self._continuation_attempts} 次续写")
         
         # 构造续写提示
         continuation_prompt = HumanMessage(
@@ -188,10 +201,14 @@ class ErrorRecoveryMiddleware(AgentMiddleware):
         )
         
         try:
-            response = await continuation_llm.ainvoke(
-                continuation_messages,
-                **kwargs,
-            )
+            token = _internal_call.set(True)
+            try:
+                response = await continuation_llm.ainvoke(
+                    continuation_messages,
+                    **kwargs,
+                )
+            finally:
+                _internal_call.reset(token)
             
             # 合并续写内容
             full_content = partial_response + response.content
@@ -207,7 +224,7 @@ class ErrorRecoveryMiddleware(AgentMiddleware):
                 response_metadata=response_metadata,
             )
         except Exception as e:
-            self.logger.error(f"续写失败: {e}")
+            logger.error(f"ErrorRecoveryMiddleware: 续写失败：{e}")
             # 续写失败时返回部分内容
             return AIMessage(
                 content=partial_response + "\n\n[⚠️ 续写失败，回复可能不完整]",
@@ -230,8 +247,12 @@ class ErrorRecoveryMiddleware(AgentMiddleware):
         
         # 调用上下文压缩
         try:
-            compressed_messages = await self.context_compressor.reactive_compact(messages)
-            self.logger.info(f"压缩完成，消息数: {len(messages)} → {len(compressed_messages)}")
+            token = _internal_call.set(True)
+            try:
+                compressed_messages = await self.context_compressor.reactive_compact(messages)
+            finally:
+                _internal_call.reset(token)
+            self.logger.info(f"压缩完成，消息数：{len(messages)} → {len(compressed_messages)}")
             
             # 用压缩后的消息重试
             return await self._call_with_retry(
@@ -247,6 +268,12 @@ class ErrorRecoveryMiddleware(AgentMiddleware):
         """
         中间件核心方法：拦截模型调用，实现错误恢复
         """
+        # 检查是否是内部 LLM 调用（避免递归）
+        if _internal_call.get():
+            logger.info("ErrorRecoveryMiddleware.awrap_model_call: internal call, passing through")
+            return await handler(request)
+        
+        logger.info("ErrorRecoveryMiddleware.awrap_model_call called")
         # 重置请求级别的状态
         self._consecutive_529_count = 0
         self._continuation_attempts = 0
@@ -259,7 +286,7 @@ class ErrorRecoveryMiddleware(AgentMiddleware):
             from langchain_core.messages import AIMessage
             last_message = response.result[-1] if hasattr(response, 'result') and response.result else None
             if isinstance(last_message, AIMessage) and self._is_truncation(last_message):
-                self.logger.info("检测到输出截断，触发续写")
+                logger.info("ErrorRecoveryMiddleware: 检测到输出截断，触发续写")
                 return await self._handle_truncation(
                     request,
                     last_message.content,
@@ -275,13 +302,13 @@ class ErrorRecoveryMiddleware(AgentMiddleware):
                 try:
                     return await self._handle_context_exceeded(request.messages)
                 except Exception as recovery_error:
-                    self.logger.error(f"上下文超限恢复失败：{recovery_error}")
+                    logger.error(f"ErrorRecoveryMiddleware: 上下文超限恢复失败：{recovery_error}")
                     raise recovery_error
             
             elif self._is_temporary_failure(e):
                 # 临时故障 → 已经由_call_with_retry 处理
                 # 但如果是未被重试捕获的异常，在这里兜底
-                self.logger.warning(f"临时故障未被重试捕获：{e}")
+                logger.warning(f"ErrorRecoveryMiddleware: 临时故障未被重试捕获：{e}")
                 raise e
             
             else:
