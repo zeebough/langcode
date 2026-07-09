@@ -258,3 +258,6 @@ s20*/
 
 # IDE
 .vscode/
+
+# testing reports
+reports/

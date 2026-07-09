@@ -1,0 +1,5 @@
+Data from source A: completed
+
+Data from source B: completed
+
+Data from source C: completed

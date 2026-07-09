@@ -11,8 +11,6 @@ from langchain.agents import create_agent
 from langchain.agents.middleware import TodoListMiddleware
 from langgraph.store.postgres import AsyncPostgresStore
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
-from psycopg_pool import AsyncConnectionPool
-from psycopg.rows import dict_row
 from typing import Any
 
 from middlewares.context_compression_middleware import ContextCompressionMiddleware
@@ -22,6 +20,8 @@ from middlewares.skill_loading_middleware import SkillLoadingMiddleware
 from middlewares.error_recovery_middleware import ErrorRecoveryMiddleware
 from lib.message_hub import AsyncPostgresMessageHub
 from lib.lead_agent_tools import create_lead_agent_tools
+from lib.dag_scheduler import DAGScheduler
+from lib.db import create_async_pool
 from logging import getLogger
 import logging
 
@@ -176,6 +176,18 @@ async def create_coding_agent(checkpointer: AsyncPostgresSaver, store: AsyncPost
     system_prompt = f"""You are a coding agent LangCode. Act, don't explain.
 Working directory: {WORK_DIR}
 Always think step by step. If you are unsure about the next step, ask the user for clarification.
+
+**DAG Decomposition Trigger**:
+If the user request meets ANY of the following criteria, you MUST use the `publish_dag` tool:
+1. **Multi-step**: The task requires >=4 distinct logical steps
+2. **Parallelizable**: The task contains naturally independent modules that can run simultaneously
+
+Examples:
+- "Generate a weekly report with sales data, competitor news, and sentiment analysis" → Trigger DAG
+- "Fix the bug in line 42" → Execute directly
+
+**User Explicit Trigger**:
+If the user explicitly says "用 DAG 分解", "Decompose this task", or similar, you MUST trigger DAG decomposition.
 """
     
     context_compression = ContextCompressionMiddleware(llm=light_llm)
@@ -201,7 +213,7 @@ Always think step by step. If you are unsure about the next step, ask the user f
         system_prompt=system_prompt,
         middleware=[
             permission_middleware,
-            TodoListMiddleware(),
+            #TodoListMiddleware(),
             MemoryManagementMiddleware(llm=light_llm, store=store),
             context_compression,
             SkillLoadingMiddleware(WORK_DIR),
@@ -217,15 +229,7 @@ Always think step by step. If you are unsure about the next step, ask the user f
 
 async def run_streaming():
     """Streaming CLI with conversation memory."""
-    DB_URI = f"postgresql://{os.getenv('POSTGRES_USER')}:{os.getenv('POSTGRES_PASSWORD')}@{os.getenv('POSTGRES_HOST')}:{os.getenv('POSTGRES_PORT')}/{os.getenv('POSTGRES_DB')}?sslmode=disable"
-    pool = AsyncConnectionPool(DB_URI, 
-                               min_size=1, 
-                               max_size=5,
-                               timeout=120,
-                               kwargs={
-                                   "autocommit": True,
-                                   "row_factory":dict_row
-                               })
+    pool = create_async_pool()
     await pool.open()
 
     checkpointer = AsyncPostgresSaver(pool)
@@ -234,7 +238,23 @@ async def run_streaming():
     await store.setup()
     
     message_hub = AsyncPostgresMessageHub(pool)
-    # await message_hub.setup()
+    await message_hub.setup()
+    
+    scheduler = DAGScheduler(pool)
+    await scheduler.setup()
+    
+    async def monitor_leased_tasks():
+        """后台监控 lease 过期任务"""
+        while True:
+            await asyncio.sleep(10)
+            try:
+                reclaimed = await scheduler.reclaim_leased_tasks()
+                if reclaimed > 0:
+                    logger.info(f"Reclaimed {reclaimed} tasks from crashed agents")
+            except Exception as e:
+                logger.error(f"Error in monitor_leased_tasks: {e}")
+    
+    monitor_task = asyncio.create_task(monitor_leased_tasks())
     
     # 创建 sub_agents 字典，用于跟踪所有 sub agent
     sub_agents = {"_thread_id": None}  # thread_id 会在后面设置
@@ -374,13 +394,13 @@ async def run_streaming():
                 print("\n[Planning] Agent updated todo list")
                 continue
             
-            if kind == "on_tool_end" and event.get("name") == "write_todos":
-                todos = event.get("data", {}).get("output")
-                if todos:
-                    print("\n[任务列表更新]")
-                    for todo in todos:
-                        print(f"  {todo['status']}: {todo['content']}")
-                continue    
+            # if kind == "on_tool_end" and event.get("name") == "write_todos":
+            #     todos = event.get("data", {}).get("output")
+            #     if todos:
+            #         print("\n[任务列表更新]")
+            #         for todo in todos:
+            #             print(f"  {todo['status']}: {todo['content']}")
+            #     continue    
         print()   
         
         if is_truncated:
@@ -395,6 +415,12 @@ async def run_streaming():
             # 静默提示，不额外输出
             pass
         
+    monitor_task.cancel()
+    try:
+        await monitor_task
+    except asyncio.CancelledError:
+        pass
+    
     await pool.close()
 
 if __name__ == "__main__":

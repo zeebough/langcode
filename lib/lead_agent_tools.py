@@ -1,13 +1,15 @@
 # lib/lead_agent_tools.py
 """Lead Agent 专用工具集"""
 import asyncio
+import json
 from typing import Any
 from pathlib import Path
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from lib.message_hub import AsyncPostgresMessageHub
-from lib.sub_agent import create_sub_agent, run_sub_agent
+from lib.sub_agent import run_sub_agent
+from lib.dag_scheduler import DAGScheduler
 import logging
 import os
 
@@ -27,7 +29,12 @@ def create_lead_agent_tools(
         sub_agents = {}
     
     if sub_agents.get("_running") is None:
-        sub_agents["_running"] = {}  # 存储运行中的 asyncio.Task
+        sub_agents["_running"] = {}
+    
+    scheduler = DAGScheduler(pool=message_hub.pool)
+
+    def current_thread_id() -> str:
+        return sub_agents.get("_thread_id") or "default"
     
     @tool
     async def spawn_sub_agent(name: str, role: str, task: str, max_rounds: int = 30) -> str:
@@ -47,7 +54,6 @@ def create_lead_agent_tools(
                 await run_sub_agent(
                     name=name,
                     role=role,
-                    initial_task=task,
                     llm=llm,
                     checkpointer=checkpointer,
                     message_hub=message_hub,
@@ -106,6 +112,8 @@ def create_lead_agent_tools(
         
         lines = []
         for name, info in sub_agents.items():
+            if name in ("_running", "_thread_id"):
+                continue
             lines.append(f"  {name}: {info['role']} - {info['status']} - Task: {info['current_task']}")
         return "\n".join(lines)
     
@@ -128,6 +136,97 @@ def create_lead_agent_tools(
             msg_type=msg_type,
         )
         return f"Message sent to '{to}'"
+    
+    @tool
+    async def publish_dag(dag_json: str) -> str:
+        """
+        发布 DAG 到任务看板
+        参数：dag_json - 符合 DAG Decomposer 输出的 JSON 字符串
+        """
+        try:
+            dag_data = json.loads(dag_json)
+            
+            result = await scheduler.insert_dag_to_db(
+                dag_data=dag_data,
+                thread_id=current_thread_id(),
+                owner=None,
+            )
+            
+            for agent_name in sub_agents.keys():
+                if agent_name not in ["_running", "_thread_id"]:
+                    await message_hub.send(
+                        from_agent="lead",
+                        to_agent=agent_name,
+                        content={"notification": "new_tasks_available"},
+                        msg_type="task_available",
+                        thread_id=current_thread_id(),
+                    )
+            
+            return f"Published {result['tasks_inserted']} tasks to board"
+        except Exception as e:
+            logger.error(f"Failed to publish DAG: {e}")
+            return f"Error publishing DAG: {str(e)}"
+    
+    @tool
+    async def get_task_board_status() -> str:
+        """查看任务看板状态（pending/in_progress/completed/failed 数量）"""
+        async with message_hub.pool.connection() as conn:
+            cursor = await conn.execute(
+                """
+                SELECT status, COUNT(*) as count
+                FROM tasks
+                WHERE thread_id = %s
+                GROUP BY status
+                """,
+                [current_thread_id()]
+            )
+            rows = await cursor.fetchall()
+            if not rows:
+                return "No tasks in board"
+            return "\n".join([f"  {row['status']}: {row['count']}" for row in rows])
+    
+    @tool
+    async def handle_agent_shutdown(agent_name: str, reason: str) -> str:
+        """处理 Sub Agent shutdown 通知"""
+        if agent_name in sub_agents:
+            del sub_agents[agent_name]
+        if "_running" in sub_agents and agent_name in sub_agents["_running"]:
+            del sub_agents["_running"][agent_name]
+        
+        async with message_hub.pool.connection() as conn:
+            cursor = await conn.execute(
+                """
+                SELECT COUNT(*) as pending_count
+                FROM tasks
+                WHERE thread_id = %s AND status = 'pending' AND blocked_by_count = 0
+                """,
+                [current_thread_id()]
+            )
+            row = await cursor.fetchone()
+            pending_count = row["pending_count"] if row else 0
+        
+        if pending_count > 0:
+            logger.info(f"Auto-spawning new sub agent to handle {pending_count} pending tasks")
+            new_agent_name = f"agent_{id(asyncio.current_task())}"
+            
+            tools = create_lead_agent_tools(
+                message_hub=message_hub,
+                sub_agents=sub_agents,
+                llm=llm,
+                light_llm=light_llm,
+                checkpointer=checkpointer,
+                work_dir=work_dir,
+            )
+            spawn_tool = next(t for t in tools if t.name == "spawn_sub_agent")
+            
+            await spawn_tool.ainvoke({
+                "name": new_agent_name,
+                "role": "task_executor",
+                "task": "Execute pending tasks from the task board",
+                "max_rounds": 50,
+            })
+        
+        return f"Sub agent '{agent_name}' shutdown handled"
     
     @tool
     async def check_inbox() -> str:
@@ -219,4 +318,7 @@ def create_lead_agent_tools(
         list_pending_permissions,
         approve_permission,
         reject_permission,
+        publish_dag,
+        get_task_board_status,
+        handle_agent_shutdown,
     ]

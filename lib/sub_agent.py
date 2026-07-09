@@ -1,17 +1,23 @@
 # lib/sub_agent.py
 """Sub Agent 创建和运行循环"""
 import os
+import asyncio
 from pathlib import Path
 from typing import Any
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import AIMessage
 from langchain.agents import create_agent
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from langchain_core.tools import tool
 
 from middlewares.error_recovery_middleware import ErrorRecoveryMiddleware
 from middlewares.context_compression_middleware import ContextCompressionMiddleware
 from middlewares.permission_middleware import PermissionMiddleware
 from lib.message_hub import AsyncPostgresMessageHub
+from lib.dag_scheduler import DAGScheduler
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 async def create_sub_agent(
@@ -83,7 +89,6 @@ Instructions:
 async def run_sub_agent(
     name: str,
     role: str,
-    initial_task: str,
     llm: ChatOpenAI,
     checkpointer: AsyncPostgresSaver,
     message_hub: AsyncPostgresMessageHub,
@@ -92,62 +97,115 @@ async def run_sub_agent(
     light_llm: ChatOpenAI | None = None,
     max_rounds: int = 30,
 ):
-    """Sub Agent 独立执行循环"""
+    """Sub Agent 主动认领 + 被动通知循环"""
     
-    status = "working"
-    current_task = initial_task
+    scheduler = DAGScheduler(pool=message_hub.pool)
+    current_task = None
+    last_activity_time = asyncio.get_event_loop().time()
+    lease_duration = 60
     
-    while status != "shutdown":
-        if status == "idle":
-            task_msg = await message_hub.wait_for_message(
-                agent_name=name,
-                timeout=300,
-                msg_type="task",
+    async def renew_heartbeat():
+        """后台心跳任务"""
+        nonlocal current_task
+        while current_task:
+            await asyncio.sleep(25)
+            if current_task:
+                try:
+                    await scheduler.renew_lease(
+                        task_id=current_task["id"],
+                        owner=name,
+                        lease_duration=lease_duration
+                    )
+                    logger.debug(f"Task {current_task['id']} heartbeat renewed")
+                except Exception as e:
+                    logger.error(f"Heartbeat renewal failed: {e}")
+    
+    while True:
+        task = await _claim_next_task(scheduler, name, thread_id)
+        
+        if task:
+            current_task = task
+            last_activity_time = asyncio.get_event_loop().time()
+            
+            heartbeat_task = asyncio.create_task(renew_heartbeat())
+            
+            try:
+                agent = await create_sub_agent(
+                    name=name,
+                    role=role,
+                    task=task["description"],
+                    llm=llm,
+                    checkpointer=checkpointer,
+                    message_hub=message_hub,
+                    thread_id=thread_id,
+                    work_dir=work_dir,
+                    light_llm=light_llm,
+                )
+                
+                messages = [{"role": "user", "content": task["description"]}]
+                config = {"configurable": {"thread_id": f"{thread_id}_{name}"}}
+                
+                result = None
+                for _ in range(max_rounds):
+                    response = await agent.ainvoke({"messages": messages}, config=config)
+                    last_message = response["messages"][-1]
+                    if isinstance(last_message, AIMessage) and not last_message.tool_calls:
+                        result = last_message.content
+                        break
+                    messages = response["messages"]
+                
+                if result:
+                    result_path = f"/tmp/task_results/{thread_id}/{task['id']}.txt"
+                    os.makedirs(os.path.dirname(result_path), exist_ok=True)
+                    with open(result_path, "w") as f:
+                        f.write(result)
+                    
+                    await scheduler.complete_task(task["id"], result[:1000], result_path)
+                    logger.info(f"Task {task['id']} completed by {name}")
+                else:
+                    retry_count = int(task.get("metadata", {}).get("retry_count", 0))
+                    can_retry = await scheduler.fail_task(task["id"], "Task execution failed", retry_count)
+                    if not can_retry:
+                        logger.warning(f"Task {task['id']} failed permanently")
+                        
+            except Exception as e:
+                logger.error(f"Task {task['id']} execution error: {e}")
+                retry_count = int(task.get("metadata", {}).get("retry_count", 0))
+                can_retry = await scheduler.fail_task(task["id"], str(e), retry_count)
+                if not can_retry:
+                    logger.warning(f"Task {task['id']} failed permanently after error")
+            finally:
+                heartbeat_task.cancel()
+                try:
+                    await heartbeat_task
+                except asyncio.CancelledError:
+                    pass
+                current_task = None
+            continue
+        
+        elapsed = asyncio.get_event_loop().time() - last_activity_time
+        if elapsed > 600:
+            logger.info(f"Sub agent {name} shutting down due to idle timeout")
+            await message_hub.send(
+                from_agent=name,
+                to_agent="lead",
+                content={"agent_name": name, "reason": "idle_timeout"},
+                msg_type="agent_shutdown",
                 thread_id=thread_id,
             )
-            
-            if task_msg is None:
+            break
+        
+        try:
+            msg = await message_hub.wait_for_message(
+                agent_name=name,
+                timeout=5,
+                msg_type="task_available",
+                thread_id=thread_id,
+            )
+            if msg:
                 continue
-            
-            current_task = task_msg["content"].get("task", task_msg["content"].get("text", ""))
-            status = "working"
-        
-        agent = await create_sub_agent(
-            name=name,
-            role=role,
-            task=current_task,
-            llm=llm,
-            checkpointer=checkpointer,
-            message_hub=message_hub,
-            thread_id=thread_id,
-            work_dir=work_dir,
-            light_llm=light_llm,
-        )
-        
-        messages = [{"role": "user", "content": current_task}]
-        config = {"configurable": {"thread_id": f"{thread_id}_{name}"}}
-        
-        result = None
-        for _ in range(max_rounds):
-            response = await agent.ainvoke({"messages": messages}, config=config)
-            
-            last_message = response["messages"][-1]
-            if isinstance(last_message, AIMessage):
-                if not last_message.tool_calls:
-                    result = last_message.content
-                    break
-            
-            messages = response["messages"]
-        
-        await message_hub.send(
-            from_agent=name,
-            to_agent="lead",
-            content={"task": current_task, "result": result or "Task completed"},
-            msg_type="result",
-            thread_id=thread_id,
-        )
-        
-        status = "idle"
+        except asyncio.TimeoutError:
+            continue
 
 
 async def _create_bash_tool():
@@ -261,3 +319,18 @@ async def _create_glob_tool():
             return f"Error: {e}"
     
     return glob
+
+
+async def _claim_next_task(scheduler: DAGScheduler, owner: str, thread_id: str) -> dict | None:
+    """
+    从任务看板认领一个任务
+    
+    Args:
+        scheduler: DAGScheduler 实例
+        owner: 认领者名称
+        thread_id: 线程 ID
+        
+    Returns:
+        认领的任务信息，无任务则返回 None
+    """
+    return await scheduler.claim_next_available_task(thread_id=thread_id, owner=owner)

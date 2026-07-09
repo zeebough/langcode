@@ -78,12 +78,15 @@ class PermissionMiddleware(AgentMiddleware):
             await asyncio.sleep(poll_interval)
             
             if self.message_hub:
-                messages = await self.message_hub.read_inbox(self.agent_name)
+                messages = await self.message_hub.read_inbox(
+                    self.agent_name,
+                    msg_type="permission_response",
+                    content_match={"request_id": request_id},
+                )
                 for msg in messages:
-                    if msg["msg_type"] == "permission_response":
-                        content = msg["content"]
-                        if content.get("request_id") == request_id:
-                            return content
+                    content = msg["content"]
+                    if content.get("request_id") == request_id:
+                        return content
             
             if self.message_hub is None:
                 await asyncio.sleep(0.1)
@@ -153,8 +156,46 @@ class PermissionMiddleware(AgentMiddleware):
         
         reason = self.check_rules(tool_name, tool_args)
         if reason:
-            if not self.ask_user(tool_name, tool_args, reason):
-                print(f"\n\033[31m⛔ Permission denied by user\033[0m")
-                return ToolMessage(content="Permission denied by user", tool_call_id=tool_id)
-        
+            if self.message_hub:
+                request_id = f"perm_{uuid4().hex[:8]}"
+                cmd = tool_args.get("command", "") or tool_args.get("file_path", "") or tool_args.get("path", "")
+
+                await self.message_hub.send(
+                    from_agent=self.agent_name,
+                    to_agent="lead",
+                    content={
+                        "request_id": request_id,
+                        "tool": tool_name,
+                        "command": cmd,
+                        "reason": reason,
+                    },
+                    msg_type="permission_request",
+                )
+
+                await self.message_hub.log_permission_request(
+                    request_id=request_id,
+                    agent_name=self.agent_name,
+                    tool_name=tool_name,
+                    command=cmd,
+                )
+
+                decision = await self._wait_for_permission_decision(request_id)
+
+                await self.message_hub.log_permission_decision(
+                    request_id=request_id,
+                    decision=decision["decision"],
+                    reason=decision.get("reason"),
+                    decided_by="user",
+                )
+
+                if decision["decision"] != "approved":
+                    return ToolMessage(
+                        content=f"Permission denied: {decision.get('reason', 'No reason provided')}",
+                        tool_call_id=tool_id,
+                    )
+            else:
+                if not self.ask_user(tool_name, tool_args, reason):
+                    print(f"\n\033[31m⛔ Permission denied by user\033[0m")
+                    return ToolMessage(content="Permission denied by user", tool_call_id=tool_id)
+
         return await handler(request)
